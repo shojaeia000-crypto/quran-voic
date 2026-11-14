@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>پیام‌رسان صوتی</title>
+<style>
+:root{--bg:#10201f;--card:#183230;--ink:#eef7f5;--mute:#8fb3ae;--acc:#3fd0b4;--bad:#ff7b72}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:var(--bg);color:var(--ink);font-family:Tahoma,system-ui,sans-serif;display:flex;justify-content:center;padding:16px}
+main{width:100%;max-width:440px}
+h1{font-size:1.3rem;margin:8px 0 16px}
+.card{background:var(--card);border-radius:14px;padding:16px;margin-bottom:14px}
+input,button{width:100%;font:inherit;border-radius:10px;border:1px solid #2c5551;padding:12px;margin-top:8px;background:#0e1b1a;color:var(--ink)}
+button{background:var(--acc);color:#04201b;border:0;font-weight:bold;cursor:pointer}
+button.ghost{background:transparent;color:var(--ink);border:1px solid #2c5551}
+button.rec{background:var(--bad);color:#fff}
+button:focus-visible,input:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+.msg{padding:10px 0;border-bottom:1px solid #2c5551}
+.msg:last-child{border:0}
+.meta{color:var(--mute);font-size:.82rem;margin-bottom:6px}
+audio{width:100%}
+.note{color:var(--mute);font-size:.82rem;line-height:1.7}
+#err{color:var(--bad);min-height:1.2em;font-size:.9rem}
+.hide{display:none}
+</style>
+</head>
+<body>
+<main>
+<h1>پیام‌رسان صوتی</h1>
+<div id="err" role="alert"></div>
+
+<!-- ورود / ثبت‌نام -->
+<section id="auth" class="card">
+  <input id="u" placeholder="نام کاربری" autocomplete="username">
+  <input id="p" type="password" placeholder="رمز عبور" autocomplete="current-password">
+  <button id="login">ورود</button>
+  <button id="signup" class="ghost">ساخت حساب جدید (حداکثر ۵ حساب)</button>
+  <p class="note">پیام‌های صوتی شما برای مدیر ارسال و در حساب او ذخیره می‌شود.</p>
+</section>
+
+<!-- کاربر -->
+<section id="user" class="card hide">
+  <div class="meta" id="hello"></div>
+  <button id="rec">🎙 شروع ضبط</button>
+  <div id="sentInfo" class="note"></div>
+  <button id="out1" class="ghost">خروج</button>
+</section>
+
+<!-- مدیر -->
+<section id="admin" class="hide">
+  <div class="card">
+    <div class="meta">صندوق مدیر — پیام‌های صوتی دریافتی</div>
+    <button id="refresh" class="ghost">بروزرسانی</button>
+    <div id="list"></div>
+  </div>
+  <button id="out2" class="ghost">خروج</button>
+</section>
+</main>
+
+<script>
+/* ============ تنظیمات: این بخش را پر کنید ============ */
+const CFG = {
+  owner: "YOUR_GITHUB_USERNAME",   // نام کاربری گیت‌هاب
+  repo:  "YOUR_DATA_REPO",         // مخزن ذخیره‌ی فایل‌ها (ترجیحاً خصوصی)
+  branch:"main",
+  token: "YOUR_FINE_GRAINED_TOKEN" // فقط دسترسی Contents: Read & Write به همین یک مخزن
+};
+const ADMIN_NAME = "امیر محمد";
+const ADMIN_PASS_HASH = null; // در اجرا محاسبه می‌شود (زیر)
+const ADMIN_PASS = "1567";
+const MAX_USERS = 5;
+/* ======================================================= */
+
+const $ = id => document.getElementById(id);
+const api = p => `https://api.github.com/repos/${CFG.owner}/${CFG.repo}/contents/${p}`;
+const H = (extra={}) => ({Authorization:`Bearer ${CFG.token}`,Accept:"application/vnd.github+json",...extra});
+const norm = s => s.replace(/[\s\u200c\u200f]/g,"").replace(/ي/g,"ی").replace(/ك/g,"ک");
+const err = m => $("err").textContent =
+  (m==="Failed to fetch" || /fetch/i.test(m||"")) ? "اتصال به گیت‌هاب ناموفق بود. تنظیمات CFG (نام کاربری، مخزن، توکن) را بررسی کنید و صفحه را از GitHub Pages باز کنید." : (m || "");
+
+async function sha256(s){
+  const b = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+  return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,"0")).join("");
+}
+const b64 = s => btoa(unescape(encodeURIComponent(s)));
+const unb64 = s => decodeURIComponent(escape(atob(s.replace(/\n/g,""))));
+
+async function getFile(path){
+  const r = await fetch(api(path)+`?ref=${CFG.branch}&t=${Date.now()}`,{headers:H()});
+  if(r.status===404) return null;
+  if(!r.ok) throw new Error("خطا در اتصال به گیت‌هاب ("+r.status+")");
+  return r.json();
+}
+async function putFile(path, contentB64, sha, msg){
+  const body = {message:msg, content:contentB64, branch:CFG.branch};
+  if(sha) body.sha = sha;
+  const r = await fetch(api(path),{method:"PUT",headers:H({"Content-Type":"application/json"}),body:JSON.stringify(body)});
+  if(!r.ok) throw new Error("ذخیره‌سازی ناموفق بود ("+r.status+")");
+  return r.json();
+}
+async function loadUsers(){
+  const f = await getFile("users.json");
+  return f ? {sha:f.sha, data:JSON.parse(unb64(f.content))} : {sha:null, data:{users:[]}};
+}
+
+let me = null;
+function show(view){
+  ["auth","user","admin"].forEach(x=>$(x).classList.toggle("hide", x!==view));
+}
+
+$("login").onclick = async ()=>{
+  err("");
+  const name = $("u").value.trim(), pass = $("p").value;
+  if(!name||!pass) return err("نام کاربری و رمز را وارد کنید.");
+  try{
+    if(norm(name)===norm(ADMIN_NAME)){
+      if(pass!==ADMIN_PASS) return err("رمز اشتباه است.");
+      me = {name, admin:true}; show("admin"); return loadList();
+    }
+    const {data} = await loadUsers();
+    const h = await sha256(pass);
+    const u = data.users.find(x=>x.name===name && x.hash===h);
+    if(!u) return err("نام کاربری یا رمز اشتباه است.");
+    me = {name}; $("hello").textContent = "سلام "+name; show("user");
+  }catch(e){ err(e.message); }
+};
+
+$("signup").onclick = async ()=>{
+  err("");
+  const name = $("u").value.trim(), pass = $("p").value;
+  if(name.length<2||pass.length<4) return err("نام حداقل ۲ و رمز حداقل ۴ حرف باشد.");
+  if(norm(name)===norm(ADMIN_NAME)) return err("این نام رزرو شده است.");
+  try{
+    const {sha,data} = await loadUsers();
+    if(data.users.some(x=>x.name===name)) return err("این نام قبلاً گرفته شده.");
+    if(data.users.length>=MAX_USERS) return err("ظرفیت ۵ حساب پر شده است.");
+    data.users.push({name, hash: await sha256(pass)});
+    await putFile("users.json", b64(JSON.stringify(data)), sha, "new user");
+    err("حساب ساخته شد. حالا وارد شوید.");
+  }catch(e){ err(e.message); }
+};
+
+/* ضبط و ارسال صدا */
+let mr=null, chunks=[];
+$("rec").onclick = async ()=>{
+  err("");
+  if(mr && mr.state==="recording"){ mr.stop(); return; }
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia({audio:true});
+    mr = new MediaRecorder(stream); chunks=[];
+    mr.ondataavailable = e=>chunks.push(e.data);
+    mr.onstop = async ()=>{
+      stream.getTracks().forEach(t=>t.stop());
+      $("rec").textContent="🎙 شروع ضبط"; $("rec").classList.remove("rec");
+      const blob = new Blob(chunks,{type:mr.mimeType||"audio/webm"});
+      const ext = (blob.type.includes("mp4")?"m4a":"webm");
+      $("sentInfo").textContent = "در حال ارسال…";
+      try{
+        const data = await new Promise(res=>{const fr=new FileReader();fr.onload=()=>res(fr.result.split(",")[1]);fr.readAsDataURL(blob);});
+        const id = Date.now()+"_"+encodeURIComponent(me.name).replace(/%/g,"");
+        await putFile(`voices/${Date.now()}__${await sha256(me.name).then(h=>h.slice(0,8))}__${encodeURIComponent(me.name)}.${ext}`, data, null, "voice from "+me.name);
+        $("sentInfo").textContent = "✓ پیام صوتی برای مدیر ارسال شد.";
+      }catch(e){ $("sentInfo").textContent=""; err(e.message); }
+    };
+    mr.start();
+    $("rec").textContent="⏹ توقف و ارسال"; $("rec").classList.add("rec");
+  }catch(e){ err("دسترسی به میکروفون ممکن نشد."); }
+};
+
+/* صندوق مدیر */
+async function loadList(){
+  const box = $("list"); box.textContent = "در حال بارگذاری…"; err("");
+  try{
+    const r = await fetch(api("voices")+`?ref=${CFG.branch}&t=${Date.now()}`,{headers:H()});
+    if(r.status===404){ box.textContent="هنوز پیامی نیامده است."; return; }
+    if(!r.ok) throw new Error("خطا در دریافت پیام‌ها ("+r.status+")");
+    const files = (await r.json()).sort((a,b)=>b.name.localeCompare(a.name));
+    if(!files.length){ box.textContent="هنوز پیامی نیامده است."; return; }
+    box.textContent="";
+    for(const f of files){
+      const [ts,,nm] = f.name.split("__");
+      const sender = decodeURIComponent((nm||"").replace(/\.[^.]+$/,""));
+      const row = document.createElement("div"); row.className="msg";
+      const meta = document.createElement("div"); meta.className="meta";
+      meta.textContent = sender+" — "+new Date(+ts).toLocaleString("fa-IR");
+      const au = document.createElement("audio"); au.controls=true; au.preload="none";
+      au.addEventListener("play", async function load(){
+        au.removeEventListener("play", load);
+        const raw = await fetch(f.url,{headers:H({Accept:"application/vnd.github.raw+json"})});
+        au.src = URL.createObjectURL(await raw.blob()); au.play();
+      });
+      row.append(meta, au); box.append(row);
+    }
+  }catch(e){ box.textContent=""; err(e.message); }
+}
+$("refresh").onclick = loadList;
+const logout = ()=>{ me=null; $("p").value=""; show("auth"); };
+$("out1").onclick = $("out2").onclick = logout;
+</script>
+</body>
+</html>
